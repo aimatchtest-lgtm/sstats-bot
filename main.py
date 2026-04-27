@@ -20,54 +20,59 @@ def safe_get(url):
         if r.status_code == 200:
             return r.json().get("data")
         elif r.status_code == 429:
-            print("Лимит! Ждем 60 сек...")
-            time.sleep(60)
+            print("⚠️ Лимит API! Ждем 65 сек...")
+            time.sleep(65)
             return safe_get(url)
         else:
-            print(f"Ошибка {r.status_code}: {url}")
+            print(f"❌ Ошибка {r.status_code}: {url}")
             return None
     except Exception as e:
-        print(f"Сбой соединения: {e}")
+        print(f"💥 Сбой соединения: {e}")
         return None
 
 def main():
-    print("🚀 Запуск реального сборщика матчей...")
+    print("🚀 Запуск полного сборщика (Матчи + Статистика + Коэффициенты)...")
     
-    # НАСТРОЙКА: Какую лигу собираем? 39 = АПЛ (England Premier League)
+    # НАСТРОЙКА: Какую лигу собираем? 39 = АПЛ
     LEAGUE_ID = 39
-    YEAR = 2024 # Сезон 2024/2025
+    YEAR = 2024 
     
     print(f"Сбор матчей для Лиги ID: {LEAGUE_ID}, Год: {YEAR}")
     
-    # 1. Получаем список матчей (лимит 100 за раз)
-    games_list = safe_get(f"{BASE}/games/list?leagueid={LEAGUE_ID}&year={YEAR}&limit=100")
+    # 1. Получаем список матчей (лимит 50 для теста, чтобы не превысить лимиты API)
+    games_list = safe_get(f"{BASE}/games/list?leagueid={LEAGUE_ID}&year={YEAR}&limit=50")
     
     if not games_list:
         print("❌ Не удалось получить список матчей.")
         return
 
-    print(f"✅ Найдено {len(games_list)} матчей. Начинаем сохранение...")
+    print(f"✅ Найдено {len(games_list)} матчей. Начинаем детальный сбор...")
     
-    saved_count = 0
+    saved_matches = 0
+    saved_odds = 0
+
     for game in games_list:
         gid = game.get("id")
         home_team = game.get("homeTeam", {}).get("name")
         away_team = game.get("awayTeam", {}).get("name")
-        date_str = game.get("date")
-        status_code = game.get("status")
         
-        # Определяем статус для БД
-        db_status = "scheduled"
-        if status_code in [8, 9, 10, 17, 18]:
-            db_status = "finished"
-        elif status_code in [3, 4, 5, 6, 7, 11, 18, 19]:
-            db_status = "live"
+        print(f"Обработка: {home_team} vs {away_team} (ID: {gid})")
+        
+        # 2. Получаем ДЕТАЛЬНЫЕ данные матча (статистика, судья, события)
+        details = safe_get(f"{BASE}/games/{gid}")
+        
+        if not details:
+            continue
             
+        game_data = details.get("game", {})
+        stats = details.get("statistics", {})
+        referee = details.get("refereeName")
+        
         # Парсинг времени
+        date_str = game_data.get("date")
         match_time = None
         if date_str:
             try:
-                # Убираем Z если есть, добавляем +00:00 для ISO формата
                 clean_date = date_str.replace('Z', '+00:00')
                 if '+' not in clean_date and '-' not in clean_date[10:]:
                      clean_date += '+00:00'
@@ -75,40 +80,92 @@ def main():
             except:
                 pass
 
-        row = {
+        # Подготовка строки для таблицы matches
+        row_match = {
             "external_id": str(gid),
-            "league_name": "Premier League", # Можно динамически, но пока хардкод для теста
+            "league_name": "Premier League",
             "home_team": home_team,
             "away_team": away_team,
             "match_time": match_time.isoformat() if match_time else None,
-            "status": db_status,
-            "score_home": game.get("homeFTResult"),
-            "score_away": game.get("awayFTResult"),
-            "ht_score_home": game.get("homeHTResult"),
-            "ht_score_away": game.get("awayHTResult"),
+            "status": "finished" if game_data.get("status") in [8, 9, 10] else "scheduled",
+            "score_home": game_data.get("homeFTResult"),
+            "score_away": game_data.get("awayFTResult"),
+            "ht_score_home": game_data.get("homeHTResult"),
+            "ht_score_away": game_data.get("awayHTResult"),
+            # Статистика (извлекаем из объекта statistics)
+            "stats_yellow_cards_home": stats.get("yellowCardsHome") if stats else None,
+            "stats_yellow_cards_away": stats.get("yellowCardsAway") if stats else None,
+            "stats_corners_home": stats.get("cornerKicksHome") if stats else None,
+            "stats_corners_away": stats.get("cornerKicksAway") if stats else None,
+            "stats_fouls_home": stats.get("foulsHome") if stats else None,
+            "stats_xg_home": stats.get("expectedGoalsHome") if stats else None,
+            "stats_xg_away": stats.get("expectedGoalsAway") if stats else None,
+            "referee_name": referee,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         
         try:
-            # Проверяем, есть ли уже такой матч
+            # Сохраняем или обновляем матч
             existing = supabase.table("matches").select("id").eq("external_id", str(gid)).execute()
-            
             if existing.data:
-                # Обновляем, если матч уже есть (например, изменился счет)
-                supabase.table("matches").update(row).eq("external_id", str(gid)).execute()
+                supabase.table("matches").update(row_match).eq("external_id", str(gid)).execute()
             else:
-                # Вставляем новый
-                supabase.table("matches").insert(row).execute()
+                supabase.table("matches").insert(row_match).execute()
+            saved_matches += 1
             
-            saved_count += 1
-            
-        except Exception as e:
-            print(f"Ошибка сохранения матча {gid}: {e}")
-            
-        # Пауза, чтобы не превысить лимиты API (если без ключа)
-        time.sleep(0.5) 
+            # 3. Сбор КОЭФФИЦИЕНТОВ (если есть)
+            odds_response = safe_get(f"{BASE}/odds/{gid}")
+            if odds_response:
+                for bookmaker_odds in odds_response:
+                    bookmaker_name = bookmaker_odds.get("bookmakerName")
+                    bets = bookmaker_odds.get("odds", [])
+                    
+                    for bet in bets:
+                        market_name = bet.get("marketName") # например "1X2"
+                        prices = bet.get("odds", []) # список котировок
+                        
+                        for price in prices:
+                            selection = price.get("name") # Home, Draw, Away
+                            value = price.get("value")
+                            opening_value = price.get("openingValue")
+                            
+                            if not all([market_name, bookmaker_name, selection, value]):
+                                continue
+                                
+                            # Сохраняем закрывающий коэффициент
+                            row_odds_close = {
+                                "match_external_id": str(gid),
+                                "market_type": market_name,
+                                "bookmaker": bookmaker_name,
+                                "selection": selection,
+                                "odd_value": float(value),
+                                "is_opening": False,
+                                "timestamp": datetime.now(timezone.utc).isoformat()
+                            }
+                            supabase.table("odds_snapshots").insert(row_odds_close).execute()
+                            saved_odds += 1
 
-    print(f"💾 Готово! Сохранено/Обновлено {saved_count} матчей.")
+                            # Если есть открывающий коэффициент - сохраняем его тоже
+                            if opening_value:
+                                row_odds_open = {
+                                    "match_external_id": str(gid),
+                                    "market_type": market_name,
+                                    "bookmaker": bookmaker_name,
+                                    "selection": selection,
+                                    "odd_value": float(opening_value),
+                                    "is_opening": True,
+                                    "timestamp": datetime.now(timezone.utc).isoformat()
+                                }
+                                supabase.table("odds_snapshots").insert(row_odds_open).execute()
+                                saved_odds += 1
+                            
+        except Exception as e:
+            print(f"Ошибка сохранения: {e}")
+            
+        # Пауза, чтобы не забанили за спам запросами (важно для бесплатного тарифа)
+        time.sleep(1.5) 
+
+    print(f"💾 Готово! Матчей: {saved_matches}, Коэффициентов: {saved_odds}")
 
 if __name__ == "__main__":
     main()
