@@ -36,17 +36,15 @@ TOP_LEAGUES = {
     679: "UEFA Europa League"
 }
 
-# Сколько сезонов собираем
 CURRENT_YEAR = 2026
 SEASONS_TO_KEEP = 3
-SEASONS = [CURRENT_YEAR - i for i in range(SEASONS_TO_KEEP)]  # [2026, 2025, 2024]
+SEASONS = [CURRENT_YEAR - i for i in range(SEASONS_TO_KEEP)]
 
 # ══════════════════════════════════════════════════════
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ══════════════════════════════════════════════════════
 
 def safe_get(url, retries=3):
-    """Безопасный GET запрос"""
     for attempt in range(retries):
         try:
             r = requests.get(url, headers=headers, timeout=30)
@@ -61,14 +59,13 @@ def safe_get(url, retries=3):
             else:
                 if attempt < retries - 1:
                     time.sleep(5)
-        except Exception as e:
+        except:
             if attempt < retries - 1:
                 time.sleep(10)
     return None
 
 
 def parse_match_time(date_str):
-    """Парсинг даты"""
     if not date_str:
         return None
     try:
@@ -81,37 +78,94 @@ def parse_match_time(date_str):
 
 
 def parse_line_value(name):
-    """Извлечение числа из строки (Over 4.5 -> 4.5)"""
     match = re.search(r'([\d.]+)', name)
     return float(match.group(1)) if match else None
 
 
 def get_team_stats_from_db(team_id, year):
-    """Получает статистику команды из БД"""
     try:
         data = supabase.table('team_stats').select('*').eq('team_id', team_id).eq('year', year).execute()
-        if data.data:
-            return data.data[0]
+        return data.data[0] if data.data else {}
     except:
-        pass
-    return {}
+        return {}
 
 
 def get_referee_stats_from_db(referee_name):
-    """Получает статистику судьи из БД"""
     if not referee_name:
         return {"avg_yellow_cards": 4.2, "avg_fouls": 25}
     try:
         data = supabase.table("referee_stats").select("*").eq("referee_name", referee_name).execute()
-        if data.data:
-            return data.data[0]
+        return data.data[0] if data.data else {"avg_yellow_cards": 4.2, "avg_fouls": 25}
     except:
-        pass
-    return {"avg_yellow_cards": 4.2, "avg_fouls": 25}
+        return {"avg_yellow_cards": 4.2, "avg_fouls": 25}
 
+
+# ══════════════════════════════════════════════════════
+# НОВЫЕ ФУНКЦИИ АНАЛИТИКИ
+# ══════════════════════════════════════════════════════
+
+def get_injuries(game_id):
+    """Травмированные игроки"""
+    data = safe_get(f"{BASE}/games/injuries?gameId={game_id}")
+    if not data:
+        return []
+    return [{"player_name": i.get("player", {}).get("name"), "team_id": i.get("teamId"), "reason": i.get("reason")} for i in data]
+
+
+def get_glicko(game_id):
+    """Рейтинг Glicko 2"""
+    data = safe_get(f"{BASE}/games/glicko/{game_id}")
+    if not data:
+        return {}
+    return {"home_rating": data.get("homeRating"), "away_rating": data.get("awayRating"), "home_win_prob": data.get("homeWinProbability"), "away_win_prob": data.get("awayWinProbability")}
+
+
+def get_referee_last_matches(referee_name, limit=5):
+    """Последние 5 матчей судьи"""
+    if not referee_name:
+        return []
+    try:
+        data = supabase.table("matches").select("*").eq("referee_name", referee_name).eq("status", "finished").order("match_time", desc=True).limit(limit).execute()
+        if not data.data:
+            return []
+        return [{"date": m.get("match_time"), "home_team": m.get("home_team"), "away_team": m.get("away_team"), "score_home": m.get("score_home"), "score_away": m.get("score_away"), "yellow_cards": (m.get("stats_yellow_cards_home") or 0) + (m.get("stats_yellow_cards_away") or 0), "fouls": (m.get("stats_fouls_home") or 0) + (m.get("stats_fouls_away") or 0), "corners": (m.get("stats_corners_home") or 0) + (m.get("stats_corners_away") or 0)} for m in data.data]
+    except:
+        return []
+
+
+def get_team_form(team_name, limit=5):
+    """Форма команды: % очков в последних матчах"""
+    if not team_name:
+        return {"form_pct": 50, "matches": 0}
+    try:
+        home = supabase.table("matches").select("*").eq("home_team", team_name).eq("status", "finished").order("match_time", desc=True).limit(limit).execute()
+        away = supabase.table("matches").select("*").eq("away_team", team_name).eq("status", "finished").order("match_time", desc=True).limit(limit).execute()
+        
+        all_matches = []
+        for m in (home.data or []):
+            if m.get("score_home") is not None:
+                pts = 3 if m["score_home"] > m["score_away"] else (1 if m["score_home"] == m["score_away"] else 0)
+                all_matches.append({"date": m["match_time"], "points": pts})
+        for m in (away.data or []):
+            if m.get("score_home") is not None:
+                pts = 3 if m["score_away"] > m["score_home"] else (1 if m["score_away"] == m["score_home"] else 0)
+                all_matches.append({"date": m["match_time"], "points": pts})
+        
+        all_matches.sort(key=lambda x: x["date"], reverse=True)
+        last = all_matches[:limit]
+        if not last:
+            return {"form_pct": 50, "matches": 0}
+        
+        return {"form_pct": round(sum(m["points"] for m in last) / (len(last) * 3) * 100, 1), "matches": len(last)}
+    except:
+        return {"form_pct": 50, "matches": 0}
+
+
+# ══════════════════════════════════════════════════════
+# H2H С ДЕТАЛЯМИ
+# ══════════════════════════════════════════════════════
 
 def get_h2h_stats(team1_id, team2_id, year):
-    """Статистика очных встреч с деталями каждого матча"""
     if not team1_id or not team2_id:
         return {"matches_count": 0, "games": []}
     
@@ -119,26 +173,16 @@ def get_h2h_stats(team1_id, team2_id, year):
     if not games:
         return {"matches_count": 0, "games": []}
     
-    h2h = {
-        "total_goals": [], 
-        "yellow_cards": [], 
-        "corners": [], 
-        "fouls": [], 
-        "matches_count": 0,
-        "games": []
-    }
-    
+    h2h = {"total_goals": [], "yellow_cards": [], "corners": [], "fouls": [], "matches_count": 0, "games": []}
     t2 = str(team2_id)
     found = 0
     
     for g in games:
         if str(g.get("homeTeam", {}).get("id", "")) != t2 and str(g.get("awayTeam", {}).get("id", "")) != t2:
             continue
-        
         gid = g.get("id")
         if not gid:
             continue
-        
         fd = safe_get(f"{BASE}/games/{gid}")
         if not fd:
             continue
@@ -157,28 +201,14 @@ def get_h2h_stats(team1_id, team2_id, year):
         h2h["fouls"].append(fouls)
         h2h["matches_count"] += 1
         
-        h2h["games"].append({
-            "date": game.get("date"),
-            "home_team": game.get("homeTeam", {}).get("name"),
-            "away_team": game.get("awayTeam", {}).get("name"),
-            "score_home": game.get("homeFTResult"),
-            "score_away": game.get("awayFTResult"),
-            "total_goals": goals,
-            "yellow_cards": yc,
-            "corners": corners,
-            "fouls": fouls
-        })
+        h2h["games"].append({"date": game.get("date"), "home_team": game.get("homeTeam", {}).get("name"), "away_team": game.get("awayTeam", {}).get("name"), "score_home": game.get("homeFTResult"), "score_away": game.get("awayFTResult"), "total_goals": goals, "yellow_cards": yc, "corners": corners, "fouls": fouls})
         
         found += 1
         if found >= 5:
             break
         time.sleep(0.2)
     
-    result = {
-        "matches_count": h2h["matches_count"],
-        "games": h2h["games"]
-    }
-    
+    result = {"matches_count": h2h["matches_count"], "games": h2h["games"]}
     for key in ["total_goals", "yellow_cards", "corners", "fouls"]:
         values = h2h[key]
         result[f"avg_{key}"] = round(stats_lib.mean(values), 1) if values else 0
@@ -193,45 +223,31 @@ def get_h2h_stats(team1_id, team2_id, year):
 # ══════════════════════════════════════════════════════
 
 def collect_team_stats_directly(league_id, year):
-    """Собирает статистику команд напрямую из матчей лиги"""
-    print(f"  📊 Сбор статистики команд из матчей...")
-    
+    print(f"  📊 Сбор статистики команд...")
     games = safe_get(f"{BASE}/games/list?leagueid={league_id}&year={year}&limit=200")
     if not games:
-        print(f"  ❌ Нет матчей для лиги {league_id}")
         return 0
     
     teams = {}
-    
     for game_summary in games:
         gid = game_summary.get("id")
         if not gid:
             continue
-        
         full = safe_get(f"{BASE}/games/{gid}")
         if not full:
             continue
-        
         game = full.get("game", {})
         stats = full.get("statistics", {})
-        
         home = game.get("homeTeam", {})
         away = game.get("awayTeam", {})
         home_id = home.get("id")
         away_id = away.get("id")
-        
         if not home_id or not away_id:
             continue
         
         for tid, tname, is_home in [(home_id, home.get("name"), True), (away_id, away.get("name"), False)]:
             if tid not in teams:
-                teams[tid] = {
-                    "name": tname,
-                    "goals_for": [], "goals_against": [],
-                    "xg_for": [], "xg_against": [],
-                    "yellow_cards": [], "corners": [], "fouls": [],
-                    "wins": 0, "draws": 0, "losses": 0, "matches": 0
-                }
+                teams[tid] = {"name": tname, "goals_for": [], "goals_against": [], "xg_for": [], "xg_against": [], "yellow_cards": [], "corners": [], "fouls": [], "wins": 0, "draws": 0, "losses": 0, "matches": 0}
             
             t = teams[tid]
             hs = game.get("homeFTResult") or 0
@@ -259,46 +275,17 @@ def collect_team_stats_directly(league_id, year):
                 if aws > hs: t["wins"] += 1
                 elif aws < hs: t["losses"] += 1
                 else: t["draws"] += 1
-            
             t["matches"] += 1
-        
         time.sleep(0.3)
     
-    # Сохраняем в БД
     saved = 0
     for team_id, data in teams.items():
         if data["matches"] == 0:
             continue
-        
         def avg(lst):
             return round(stats_lib.mean(lst), 2) if lst else 0
-        
         try:
-            row = {
-                "team_id": int(team_id),
-                "team_name": data["name"],
-                "league_id": league_id,
-                "year": year,
-                "league_name": TOP_LEAGUES.get(league_id, "Unknown"),
-                "matches_played": data["matches"],
-                "wins": data["wins"],
-                "draws": data["draws"],
-                "losses": data["losses"],
-                "goals_for": sum(data["goals_for"]),
-                "goals_against": sum(data["goals_against"]),
-                "goals_for_avg": avg(data["goals_for"]),
-                "goals_against_avg": avg(data["goals_against"]),
-                "xg_for": round(sum(data["xg_for"]), 2),
-                "xg_against": round(sum(data["xg_against"]), 2),
-                "xg_for_avg": avg(data["xg_for"]),
-                "xg_against_avg": avg(data["xg_against"]),
-                "points": data["wins"] * 3 + data["draws"],
-                "avg_yellow_cards_for": avg(data["yellow_cards"]),
-                "avg_corners_for": avg(data["corners"]),
-                "avg_fouls_for": avg(data["fouls"]),
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-            
+            row = {"team_id": int(team_id), "team_name": data["name"], "league_id": league_id, "year": year, "league_name": TOP_LEAGUES.get(league_id, "Unknown"), "matches_played": data["matches"], "wins": data["wins"], "draws": data["draws"], "losses": data["losses"], "goals_for": sum(data["goals_for"]), "goals_against": sum(data["goals_against"]), "goals_for_avg": avg(data["goals_for"]), "goals_against_avg": avg(data["goals_against"]), "xg_for": round(sum(data["xg_for"]), 2), "xg_against": round(sum(data["xg_against"]), 2), "xg_for_avg": avg(data["xg_for"]), "xg_against_avg": avg(data["xg_against"]), "points": data["wins"] * 3 + data["draws"], "avg_yellow_cards_for": avg(data["yellow_cards"]), "avg_corners_for": avg(data["corners"]), "avg_fouls_for": avg(data["fouls"]), "updated_at": datetime.now(timezone.utc).isoformat()}
             existing = supabase.table("team_stats").select("id").eq("team_id", team_id).eq("year", year).execute()
             if existing.data:
                 supabase.table("team_stats").update(row).eq("team_id", team_id).eq("year", year).execute()
@@ -307,64 +294,40 @@ def collect_team_stats_directly(league_id, year):
             saved += 1
         except Exception as e:
             print(f"    ❌ Ошибка сохранения {data['name']}: {e}")
-    
     return saved
 
 
-# ══════════════════════════════════════════════════════
-# СБОР СТАТИСТИКИ СУДЕЙ
-# ══════════════════════════════════════════════════════
-
 def update_referee_stats(league_id, year):
-    """Собирает статистику судей из матчей"""
     print(f"  👨‍⚖️ Сбор статистики судей...")
-    
     games = safe_get(f"{BASE}/games/list?leagueid={league_id}&year={year}&limit=200")
     if not games:
         return
-    
     refs = {}
-    
     for game_summary in games:
         gid = game_summary.get("id")
         if not gid:
             continue
-        
         full = safe_get(f"{BASE}/games/{gid}")
         if not full:
             continue
-        
         rname = full.get("refereeName")
         if not rname:
             continue
-        
         stats = full.get("statistics", {})
-        
         if rname not in refs:
             refs[rname] = {"yellow_cards": [], "fouls": [], "corners": [], "matches": 0}
-        
         yc = (stats.get("yellowCardsHome") or 0) + (stats.get("yellowCardsAway") or 0)
         fouls = (stats.get("foulsHome") or 0) + (stats.get("foulsAway") or 0)
         corners = (stats.get("cornerKicksHome") or 0) + (stats.get("cornerKicksAway") or 0)
-        
         refs[rname]["yellow_cards"].append(yc)
         refs[rname]["fouls"].append(fouls)
         refs[rname]["corners"].append(corners)
         refs[rname]["matches"] += 1
-        
         time.sleep(0.2)
     
     for name, data in refs.items():
         try:
-            row = {
-                "referee_name": name,
-                "avg_yellow_cards": round(stats_lib.mean(data["yellow_cards"]), 1) if data["yellow_cards"] else 0,
-                "avg_fouls": round(stats_lib.mean(data["fouls"]), 1) if data["fouls"] else 0,
-                "avg_corners": round(stats_lib.mean(data["corners"]), 1) if data["corners"] else 0,
-                "matches_officiated": data["matches"],
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-            
+            row = {"referee_name": name, "avg_yellow_cards": round(stats_lib.mean(data["yellow_cards"]), 1) if data["yellow_cards"] else 0, "avg_fouls": round(stats_lib.mean(data["fouls"]), 1) if data["fouls"] else 0, "avg_corners": round(stats_lib.mean(data["corners"]), 1) if data["corners"] else 0, "matches_officiated": data["matches"], "updated_at": datetime.now(timezone.utc).isoformat()}
             existing = supabase.table("referee_stats").select("id").eq("referee_name", name).execute()
             if existing.data:
                 supabase.table("referee_stats").update(row).eq("referee_name", name).execute()
@@ -372,7 +335,6 @@ def update_referee_stats(league_id, year):
                 supabase.table("referee_stats").insert(row).execute()
         except Exception as e:
             print(f"    ❌ Ошибка сохранения судьи {name}: {e}")
-    
     print(f"  ✅ Сохранено {len(refs)} судей")
 
 
@@ -381,7 +343,6 @@ def update_referee_stats(league_id, year):
 # ══════════════════════════════════════════════════════
 
 def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_id, home_name, away_name, year):
-    """Генерирует умные вердикты на основе всех данных"""
     verdicts = []
     
     home_stats = get_team_stats_from_db(home_id, year) if home_id else {}
@@ -389,7 +350,15 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
     h2h = get_h2h_stats(home_id, away_id, year) if home_id and away_id else {}
     ref_stats = get_referee_stats_from_db(referee_name)
     
-    # Извлекаем линии букмекера
+    # НОВОЕ: травмы, glicko, форма, матчи судьи
+    game_id = game.get("id")
+    injuries = get_injuries(game_id) if game_id else []
+    glicko = get_glicko(game_id) if game_id else {}
+    home_form = get_team_form(home_name)
+    away_form = get_team_form(away_name)
+    ref_matches = get_referee_last_matches(referee_name)
+    
+    # Извлекаем линии
     lines = {}
     for market in odds_list:
         m_name = market.get("marketName", "")
@@ -421,6 +390,31 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
                     if val and 15 <= val <= 40:
                         lines["fouls"] = {"line": val, "odds": odd_value}
     
+    # Динамические веса
+    h2h_weight = 0.40
+    if h2h.get("matches_count", 0) < 2:
+        h2h_weight = 0.20
+    team_weight = 0.30
+    if home_form.get("form_pct", 50) > 70:
+        team_weight = 0.38
+    elif home_form.get("form_pct", 50) < 30:
+        team_weight = 0.22
+    
+    # Glicko бонус
+    glicko_bonus = 0
+    if glicko:
+        diff = (glicko.get("home_rating", 1500) or 1500) - (glicko.get("away_rating", 1500) or 1500)
+        if diff > 200:
+            glicko_bonus = 0.2
+        elif diff < -200:
+            glicko_bonus = -0.2
+    
+    # Травмы защиты
+    injury_penalty = 0
+    for inj in injuries:
+        if inj.get("team_id") == home_id:
+            injury_penalty += 0.15
+    
     # ---- ВЕРДИКТ ПО ЖК ----
     if "yellow_cards" in lines:
         line = lines["yellow_cards"]["line"]
@@ -434,7 +428,7 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
         
         if h2h.get("avg_yellow_cards", 0) > 0:
             preds.append(h2h["avg_yellow_cards"])
-            weights.append(0.40)
+            weights.append(h2h_weight)
         
         preds.append(ref_stats.get("avg_yellow_cards", 4.2))
         weights.append(0.25)
@@ -450,32 +444,13 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
             pred = sum(p * ww for p, ww in zip(preds, w))
             diff = pred - line
             
-            if diff >= 1.0:
-                conf, rec = "HIGH", f"TAKE_TB_{line}"
-            elif diff >= 0.4:
-                conf, rec = "MEDIUM", f"TAKE_TB_{line}"
-            elif diff <= -1.0:
-                conf, rec = "MEDIUM", f"TAKE_TM_{line}"
-            elif diff <= -0.4:
-                conf, rec = "LOW", f"TAKE_TM_{line}"
-            else:
-                conf, rec = "LOW", "SKIP"
+            if diff >= 1.0: conf, rec = "HIGH", f"TAKE_TB_{line}"
+            elif diff >= 0.4: conf, rec = "MEDIUM", f"TAKE_TB_{line}"
+            elif diff <= -1.0: conf, rec = "MEDIUM", f"TAKE_TM_{line}"
+            elif diff <= -0.4: conf, rec = "LOW", f"TAKE_TM_{line}"
+            else: conf, rec = "LOW", "SKIP"
             
-            verdicts.append({
-                "market_type": "YELLOW_CARDS",
-                "recommendation": rec,
-                "confidence": conf,
-                "analysis_json": {
-                    "model_prediction": round(pred, 1),
-                    "bookmaker_line": line,
-                    "difference": round(diff, 1),
-                    "h2h_avg": h2h.get("avg_yellow_cards", 0),
-                    "h2h_matches": h2h.get("matches_count", 0),
-                    "referee_avg": ref_stats.get("avg_yellow_cards"),
-                    "referee_name": referee_name,
-                    "h2h_games": h2h.get("games", [])
-                }
-            })
+            verdicts.append({"market_type": "YELLOW_CARDS", "recommendation": rec, "confidence": conf, "analysis_json": {"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg": h2h.get("avg_yellow_cards", 0), "h2h_matches": h2h.get("matches_count", 0), "referee_avg": ref_stats.get("avg_yellow_cards"), "referee_name": referee_name, "h2h_games": h2h.get("games", []), "referee_last_matches": ref_matches, "injuries": injuries, "glicko": glicko, "home_form_pct": home_form.get("form_pct"), "away_form_pct": away_form.get("form_pct")}})
     
     # ---- ВЕРДИКТ ПО ГОЛАМ ----
     if "total_goals" in lines:
@@ -485,12 +460,12 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
         hg = home_stats.get("goals_for_avg", 0)
         ag = away_stats.get("goals_for_avg", 0)
         if hg and ag:
-            preds.append(hg + ag)
-            weights.append(0.30)
+            preds.append(hg + ag + glicko_bonus + injury_penalty)
+            weights.append(team_weight)
         
         if h2h.get("avg_total_goals", 0) > 0:
             preds.append(h2h["avg_total_goals"])
-            weights.append(0.50)
+            weights.append(h2h_weight)
         
         xg_h = statistics.get("calculatedXgHome") or 0
         xg_a = statistics.get("calculatedXgAway") or 0
@@ -504,31 +479,13 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
             pred = sum(p * ww for p, ww in zip(preds, w))
             diff = pred - line
             
-            if diff >= 0.8:
-                conf, rec = "HIGH", f"TAKE_TB_{line}"
-            elif diff >= 0.3:
-                conf, rec = "MEDIUM", f"TAKE_TB_{line}"
-            elif diff <= -0.8:
-                conf, rec = "MEDIUM", f"TAKE_TM_{line}"
-            elif diff <= -0.3:
-                conf, rec = "LOW", f"TAKE_TM_{line}"
-            else:
-                conf, rec = "LOW", "SKIP"
+            if diff >= 0.8: conf, rec = "HIGH", f"TAKE_TB_{line}"
+            elif diff >= 0.3: conf, rec = "MEDIUM", f"TAKE_TB_{line}"
+            elif diff <= -0.8: conf, rec = "MEDIUM", f"TAKE_TM_{line}"
+            elif diff <= -0.3: conf, rec = "LOW", f"TAKE_TM_{line}"
+            else: conf, rec = "LOW", "SKIP"
             
-            verdicts.append({
-                "market_type": "GOALS",
-                "recommendation": rec,
-                "confidence": conf,
-                "analysis_json": {
-                    "model_prediction": round(pred, 1),
-                    "bookmaker_line": line,
-                    "difference": round(diff, 1),
-                    "h2h_avg_goals": h2h.get("avg_total_goals", 0),
-                    "h2h_matches": h2h.get("matches_count", 0),
-                    "xg_total": round(xg_h + xg_a, 1),
-                    "h2h_games": h2h.get("games", [])
-                }
-            })
+            verdicts.append({"market_type": "GOALS", "recommendation": rec, "confidence": conf, "analysis_json": {"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg_goals": h2h.get("avg_total_goals", 0), "h2h_matches": h2h.get("matches_count", 0), "xg_total": round(xg_h + xg_a, 1), "h2h_games": h2h.get("games", []), "referee_last_matches": ref_matches, "injuries": injuries, "glicko": glicko, "home_form_pct": home_form.get("form_pct"), "away_form_pct": away_form.get("form_pct")}})
     
     # ---- ВЕРДИКТ ПО УГЛОВЫМ ----
     if "corners" in lines:
@@ -543,7 +500,7 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
         
         if h2h.get("avg_corners", 0) > 0:
             preds.append(h2h["avg_corners"])
-            weights.append(0.45)
+            weights.append(h2h_weight)
         
         cur_c = (statistics.get("cornerKicksHome") or 0) + (statistics.get("cornerKicksAway") or 0)
         if cur_c > 0:
@@ -556,29 +513,13 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
             pred = sum(p * ww for p, ww in zip(preds, w))
             diff = pred - line
             
-            if diff >= 2.0:
-                conf, rec = "HIGH", f"TAKE_TB_{line}"
-            elif diff >= 1.0:
-                conf, rec = "MEDIUM", f"TAKE_TB_{line}"
-            elif diff <= -2.0:
-                conf, rec = "MEDIUM", f"TAKE_TM_{line}"
-            elif diff <= -1.0:
-                conf, rec = "LOW", f"TAKE_TM_{line}"
-            else:
-                conf, rec = "LOW", "SKIP"
+            if diff >= 2.0: conf, rec = "HIGH", f"TAKE_TB_{line}"
+            elif diff >= 1.0: conf, rec = "MEDIUM", f"TAKE_TB_{line}"
+            elif diff <= -2.0: conf, rec = "MEDIUM", f"TAKE_TM_{line}"
+            elif diff <= -1.0: conf, rec = "LOW", f"TAKE_TM_{line}"
+            else: conf, rec = "LOW", "SKIP"
             
-            verdicts.append({
-                "market_type": "CORNERS",
-                "recommendation": rec,
-                "confidence": conf,
-                "analysis_json": {
-                    "model_prediction": round(pred, 1),
-                    "bookmaker_line": line,
-                    "difference": round(diff, 1),
-                    "h2h_avg_corners": h2h.get("avg_corners", 0),
-                    "h2h_games": h2h.get("games", [])
-                }
-            })
+            verdicts.append({"market_type": "CORNERS", "recommendation": rec, "confidence": conf, "analysis_json": {"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg_corners": h2h.get("avg_corners", 0), "h2h_games": h2h.get("games", []), "referee_last_matches": ref_matches, "injuries": injuries, "glicko": glicko, "home_form_pct": home_form.get("form_pct"), "away_form_pct": away_form.get("form_pct")}})
     
     # ---- ВЕРДИКТ ПО ФОЛАМ ----
     if "fouls" in lines:
@@ -593,7 +534,7 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
         
         if h2h.get("avg_fouls", 0) > 0:
             preds.append(h2h["avg_fouls"])
-            weights.append(0.40)
+            weights.append(h2h_weight)
         
         ref_fouls = ref_stats.get("avg_fouls", 25)
         preds.append(ref_fouls)
@@ -610,32 +551,13 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
             pred = sum(p * ww for p, ww in zip(preds, w))
             diff = pred - line
             
-            if diff >= 4.0:
-                conf, rec = "HIGH", f"TAKE_TB_{line}"
-            elif diff >= 2.0:
-                conf, rec = "MEDIUM", f"TAKE_TB_{line}"
-            elif diff <= -4.0:
-                conf, rec = "MEDIUM", f"TAKE_TM_{line}"
-            elif diff <= -2.0:
-                conf, rec = "LOW", f"TAKE_TM_{line}"
-            else:
-                conf, rec = "LOW", "SKIP"
+            if diff >= 4.0: conf, rec = "HIGH", f"TAKE_TB_{line}"
+            elif diff >= 2.0: conf, rec = "MEDIUM", f"TAKE_TB_{line}"
+            elif diff <= -4.0: conf, rec = "MEDIUM", f"TAKE_TM_{line}"
+            elif diff <= -2.0: conf, rec = "LOW", f"TAKE_TM_{line}"
+            else: conf, rec = "LOW", "SKIP"
             
-            verdicts.append({
-                "market_type": "FOULS",
-                "recommendation": rec,
-                "confidence": conf,
-                "analysis_json": {
-                    "model_prediction": round(pred, 1),
-                    "bookmaker_line": line,
-                    "difference": round(diff, 1),
-                    "h2h_avg_fouls": h2h.get("avg_fouls", 0),
-                    "h2h_matches": h2h.get("matches_count", 0),
-                    "referee_avg_fouls": ref_fouls,
-                    "referee_name": referee_name,
-                    "h2h_games": h2h.get("games", [])
-                }
-            })
+            verdicts.append({"market_type": "FOULS", "recommendation": rec, "confidence": conf, "analysis_json": {"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg_fouls": h2h.get("avg_fouls", 0), "h2h_matches": h2h.get("matches_count", 0), "referee_avg_fouls": ref_fouls, "referee_name": referee_name, "h2h_games": h2h.get("games", []), "referee_last_matches": ref_matches, "injuries": injuries, "glicko": glicko, "home_form_pct": home_form.get("form_pct"), "away_form_pct": away_form.get("form_pct")}})
     
     return verdicts
 
@@ -645,7 +567,7 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
 # ══════════════════════════════════════════════════════
 
 def main():
-    print("🚀 ЗАПУСК СБОРЩИКА (14 лиг, 3 сезона)")
+    print("🚀 ЗАПУСК СБОРЩИКА (14 лиг, 3 сезона) + ТРАВМЫ, GLICKO, ФОРМА")
     print("=" * 55)
     
     total_matches = 0
@@ -659,14 +581,12 @@ def main():
         for year in SEASONS:
             print(f"\n📅 Сезон {year-1}/{year}")
             
-            # Проверяем есть ли уже командная статистика
             stats_count = supabase.table("team_stats").select("id", count="exact").eq("league_id", league_id).eq("year", year).execute()
             if not stats_count.count:
                 print(f"  📊 Статистика команд не найдена. Собираем...")
                 collect_team_stats_directly(league_id, year)
                 update_referee_stats(league_id, year)
             
-            # Получаем матчи
             games = safe_get(f"{BASE}/games/list?leagueid={league_id}&year={year}&limit=200")
             
             if not games:
@@ -703,28 +623,7 @@ def main():
                 gs_code = game.get("status")
                 status = "finished" if gs_code in [8, 9, 10] else ("live" if gs_code in [1, 2, 3] else "scheduled")
                 
-                row = {
-                    "external_id": str(gid),
-                    "league_name": league_name,
-                    "home_team": home_name,
-                    "away_team": away_name,
-                    "match_time": mt.isoformat() if mt else None,
-                    "status": status,
-                    "score_home": game.get("homeFTResult"),
-                    "score_away": game.get("awayFTResult"),
-                    "ht_score_home": game.get("homeHTResult"),
-                    "ht_score_away": game.get("awayHTResult"),
-                    "stats_yellow_cards_home": stats.get("yellowCardsHome"),
-                    "stats_yellow_cards_away": stats.get("yellowCardsAway"),
-                    "stats_corners_home": stats.get("cornerKicksHome"),
-                    "stats_corners_away": stats.get("cornerKicksAway"),
-                    "stats_fouls_home": stats.get("foulsHome"),
-                    "stats_fouls_away": stats.get("foulsAway"),
-                    "stats_xg_home": stats.get("calculatedXgHome"),
-                    "stats_xg_away": stats.get("calculatedXgAway"),
-                    "referee_name": ref_name,
-                    "updated_at": datetime.now(timezone.utc).isoformat()
-                }
+                row = {"external_id": str(gid), "league_name": league_name, "home_team": home_name, "away_team": away_name, "match_time": mt.isoformat() if mt else None, "status": status, "score_home": game.get("homeFTResult"), "score_away": game.get("awayFTResult"), "ht_score_home": game.get("homeHTResult"), "ht_score_away": game.get("awayHTResult"), "stats_yellow_cards_home": stats.get("yellowCardsHome"), "stats_yellow_cards_away": stats.get("yellowCardsAway"), "stats_corners_home": stats.get("cornerKicksHome"), "stats_corners_away": stats.get("cornerKicksAway"), "stats_fouls_home": stats.get("foulsHome"), "stats_fouls_away": stats.get("foulsAway"), "stats_xg_home": stats.get("calculatedXgHome"), "stats_xg_away": stats.get("calculatedXgAway"), "referee_name": ref_name, "updated_at": datetime.now(timezone.utc).isoformat()}
                 
                 try:
                     existing = supabase.table("matches").select("id").eq("external_id", str(gid)).execute()
@@ -734,19 +633,11 @@ def main():
                         supabase.table("matches").insert(row).execute()
                     total_matches += 1
                     
-                    # Генерируем вердикты
                     verdicts = generate_verdicts(game, stats, odds, ref_name, home_id, away_id, home_name, away_name, year)
                     
-                    # Удаляем старые вердикты и сохраняем новые
                     supabase.table("match_verdicts").delete().eq("match_external_id", str(gid)).execute()
                     for v in verdicts:
-                        supabase.table("match_verdicts").insert({
-                            "match_external_id": str(gid),
-                            "market_type": v["market_type"],
-                            "recommendation": v["recommendation"],
-                            "confidence": v["confidence"],
-                            "analysis_json": v["analysis_json"]
-                        }).execute()
+                        supabase.table("match_verdicts").insert({"match_external_id": str(gid), "market_type": v["market_type"], "recommendation": v["recommendation"], "confidence": v["confidence"], "analysis_json": v["analysis_json"]}).execute()
                         total_verdicts += 1
                     
                 except Exception as e:
@@ -758,7 +649,6 @@ def main():
     print(f"🎉 ГОТОВО!")
     print(f"📊 Матчей: {total_matches}")
     print(f"🎯 Вердиктов: {total_verdicts}")
-    print(f"💾 Размер БД: ~108 МБ (из 500 МБ)")
     print(f"{'='*55}")
 
 
