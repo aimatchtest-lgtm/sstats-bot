@@ -20,11 +20,11 @@ BASE = "https://api.sstats.net"
 
 # 14 топовых лиг мира
 TOP_LEAGUES = {
-    342: "Premier League",
+    39: "Premier League",
     140: "La Liga",
     78: "Bundesliga",
     135: "Serie A",
-    186: "Ligue 1",
+    61: "Ligue 1",
     88: "Eredivisie",
     94: "Primeira Liga",
     235: "Russian Premier League",
