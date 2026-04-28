@@ -20,20 +20,20 @@ BASE = "https://api.sstats.net"
 
 # 14 топовых лиг мира
 TOP_LEAGUES = {
-    39: "Premier League",
-    41: "La Liga",
-    45: "Bundesliga",
+    342: "Premier League",
+    140: "La Liga",
+    78: "Bundesliga",
     135: "Serie A",
-    44: "Ligue 1",
-    57: "Eredivisie",
-    76: "Primeira Liga",
-    81: "Russian Premier League",
-    42: "EFL League One",
-    43: "EFL League Two",
-    82: "Russian First League",
+    186: "Ligue 1",
+    88: "Eredivisie",
+    94: "Primeira Liga",
+    235: "Russian Premier League",
+    41: "EFL League One",
+    42: "EFL League Two",
+    236: "Russian First League",
     307: "Saudi Pro League",
-    7: "UEFA Champions League",
-    679: "UEFA Europa League"
+    2: "UEFA Champions League",
+    3: "UEFA Europa League"
 }
 
 CURRENT_YEAR = 2026
