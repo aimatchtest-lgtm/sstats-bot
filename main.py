@@ -571,6 +571,8 @@ def main():
                     if existing.data: supabase.table("matches").update(row).eq("external_id", str(gid)).execute()
                     else: supabase.table("matches").insert(row).execute()
                     total_matches += 1
+                    if status == "finished":
+                        supabase.table("match_verdicts").delete().eq("match_external_id", str(gid)).execute()
                     if status in ["scheduled", "live"]:
                         verdicts = generate_verdicts(game, stats, odds, ref_name, home_id, away_id, home_name, away_name, year)
                         supabase.table("match_verdicts").delete().eq("match_external_id", str(gid)).execute()
