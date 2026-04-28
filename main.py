@@ -18,7 +18,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 headers = {"apikey": API_KEY} if API_KEY else {}
 BASE = "https://api.sstats.net"
 
-# 14 топовых лиг мира
 TOP_LEAGUES = {
     39: "Premier League",
     140: "La Liga",
@@ -162,6 +161,78 @@ def get_team_form(team_name, limit=5):
 
 
 # ══════════════════════════════════════════════════════
+# АНАЛИЗ СОСТАВОВ (НОВОЕ!)
+# ══════════════════════════════════════════════════════
+
+def get_lineup(game_id):
+    """Получает состав на матч"""
+    full = safe_get(f"{BASE}/games/{game_id}")
+    if not full:
+        return []
+    return full.get("lineupPlayers", [])
+
+
+def analyze_missing_players(home_id, away_id, game_id):
+    """
+    Анализирует отсутствующих игроков и их влияние.
+    Возвращает penalty для голов и подробную аналитику.
+    """
+    # Получаем травмы
+    injuries = get_injuries(game_id)
+    injured_names = [i["player_name"] for i in injuries]
+    
+    # Получаем состав
+    lineup = get_lineup(game_id)
+    playing_names = [p["playerName"] for p in lineup]
+    
+    # Собираем отсутствующих (травмы + не в составе)
+    missing_home = []
+    missing_away = []
+    
+    for inj in injuries:
+        player_name = inj["player_name"]
+        # Ищем статистику игрока в БД
+        player_stats = get_player_stats_from_db(player_name)
+        
+        info = {
+            "name": player_name,
+            "reason": inj.get("reason", "неизвестно"),
+            "position": player_stats.get("position", "?"),
+            "importance": player_stats.get("importance", "medium"),
+            "goals_impact": player_stats.get("goals_impact", 0)
+        }
+        
+        if inj["team_id"] == home_id:
+            missing_home.append(info)
+        else:
+            missing_away.append(info)
+    
+    # Считаем суммарное влияние на голы
+    home_penalty = sum(p["goals_impact"] for p in missing_home)
+    away_penalty = sum(p["goals_impact"] for p in missing_away)
+    
+    # Итоговый penalty: если у хозяев нет защитников → больше голов гостям
+    total_penalty = away_penalty - home_penalty
+    
+    return {
+        "missing_home": missing_home,
+        "missing_away": missing_away,
+        "total_penalty": total_penalty,
+        "home_penalty": home_penalty,
+        "away_penalty": away_penalty
+    }
+
+
+def get_player_stats_from_db(player_name):
+    """Получает статистику игрока из БД"""
+    try:
+        data = supabase.table("player_stats").select("*").eq("player_name", player_name).execute()
+        return data.data[0] if data.data else {}
+    except:
+        return {}
+
+
+# ══════════════════════════════════════════════════════
 # H2H С ДЕТАЛЯМИ
 # ══════════════════════════════════════════════════════
 
@@ -224,7 +295,7 @@ def get_h2h_stats(team1_id, team2_id, year):
 
 def collect_team_stats_directly(league_id, year):
     print(f"  📊 Сбор статистики команд...")
-    games = safe_get(f"{BASE}/games/list?leagueid={league_id}&year={year}&limit=200")
+    games = safe_get(f"{BASE}/games/list?leagueid={league_id}&year={year}&limit=50")
     if not games:
         return 0
     
@@ -276,7 +347,7 @@ def collect_team_stats_directly(league_id, year):
                 elif aws < hs: t["losses"] += 1
                 else: t["draws"] += 1
             t["matches"] += 1
-        time.sleep(0.3)
+        time.sleep(1.0)
     
     saved = 0
     for team_id, data in teams.items():
@@ -299,7 +370,7 @@ def collect_team_stats_directly(league_id, year):
 
 def update_referee_stats(league_id, year):
     print(f"  👨‍⚖️ Сбор статистики судей...")
-    games = safe_get(f"{BASE}/games/list?leagueid={league_id}&year={year}&limit=200")
+    games = safe_get(f"{BASE}/games/list?leagueid={league_id}&year={year}&limit=50")
     if not games:
         return
     refs = {}
@@ -350,13 +421,15 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
     h2h = get_h2h_stats(home_id, away_id, year) if home_id and away_id else {}
     ref_stats = get_referee_stats_from_db(referee_name)
     
-    # НОВОЕ: травмы, glicko, форма, матчи судьи
     game_id = game.get("id")
     injuries = get_injuries(game_id) if game_id else []
     glicko = get_glicko(game_id) if game_id else {}
     home_form = get_team_form(home_name)
     away_form = get_team_form(away_name)
     ref_matches = get_referee_last_matches(referee_name)
+    
+    # НОВОЕ: Анализ составов
+    missing_analysis = analyze_missing_players(home_id, away_id, game_id) if game_id else {"total_penalty": 0, "missing_home": [], "missing_away": []}
     
     # Извлекаем линии
     lines = {}
@@ -409,11 +482,21 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
         elif diff < -200:
             glicko_bonus = -0.2
     
-    # Травмы защиты
-    injury_penalty = 0
-    for inj in injuries:
-        if inj.get("team_id") == home_id:
-            injury_penalty += 0.15
+    # Общий penalty от составов
+    lineup_penalty = missing_analysis.get("total_penalty", 0)
+    
+    # Базовая аналитика для всех вердиктов
+    base_analysis = {
+        "injuries": injuries,
+        "glicko": glicko,
+        "home_form_pct": home_form.get("form_pct"),
+        "away_form_pct": away_form.get("form_pct"),
+        "referee_last_matches": ref_matches,
+        "h2h_games": h2h.get("games", []),
+        "missing_home": missing_analysis.get("missing_home", []),
+        "missing_away": missing_analysis.get("missing_away", []),
+        "lineup_penalty": lineup_penalty
+    }
     
     # ---- ВЕРДИКТ ПО ЖК ----
     if "yellow_cards" in lines:
@@ -450,7 +533,9 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
             elif diff <= -0.4: conf, rec = "LOW", f"TAKE_TM_{line}"
             else: conf, rec = "LOW", "SKIP"
             
-            verdicts.append({"market_type": "YELLOW_CARDS", "recommendation": rec, "confidence": conf, "analysis_json": {"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg": h2h.get("avg_yellow_cards", 0), "h2h_matches": h2h.get("matches_count", 0), "referee_avg": ref_stats.get("avg_yellow_cards"), "referee_name": referee_name, "h2h_games": h2h.get("games", []), "referee_last_matches": ref_matches, "injuries": injuries, "glicko": glicko, "home_form_pct": home_form.get("form_pct"), "away_form_pct": away_form.get("form_pct")}})
+            analysis = base_analysis.copy()
+            analysis.update({"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg": h2h.get("avg_yellow_cards", 0), "h2h_matches": h2h.get("matches_count", 0), "referee_avg": ref_stats.get("avg_yellow_cards"), "referee_name": referee_name})
+            verdicts.append({"market_type": "YELLOW_CARDS", "recommendation": rec, "confidence": conf, "analysis_json": analysis})
     
     # ---- ВЕРДИКТ ПО ГОЛАМ ----
     if "total_goals" in lines:
@@ -460,7 +545,7 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
         hg = home_stats.get("goals_for_avg", 0)
         ag = away_stats.get("goals_for_avg", 0)
         if hg and ag:
-            preds.append(hg + ag + glicko_bonus + injury_penalty)
+            preds.append(hg + ag + glicko_bonus + lineup_penalty)
             weights.append(team_weight)
         
         if h2h.get("avg_total_goals", 0) > 0:
@@ -485,7 +570,9 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
             elif diff <= -0.3: conf, rec = "LOW", f"TAKE_TM_{line}"
             else: conf, rec = "LOW", "SKIP"
             
-            verdicts.append({"market_type": "GOALS", "recommendation": rec, "confidence": conf, "analysis_json": {"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg_goals": h2h.get("avg_total_goals", 0), "h2h_matches": h2h.get("matches_count", 0), "xg_total": round(xg_h + xg_a, 1), "h2h_games": h2h.get("games", []), "referee_last_matches": ref_matches, "injuries": injuries, "glicko": glicko, "home_form_pct": home_form.get("form_pct"), "away_form_pct": away_form.get("form_pct")}})
+            analysis = base_analysis.copy()
+            analysis.update({"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg_goals": h2h.get("avg_total_goals", 0), "h2h_matches": h2h.get("matches_count", 0), "xg_total": round(xg_h + xg_a, 1)})
+            verdicts.append({"market_type": "GOALS", "recommendation": rec, "confidence": conf, "analysis_json": analysis})
     
     # ---- ВЕРДИКТ ПО УГЛОВЫМ ----
     if "corners" in lines:
@@ -519,7 +606,9 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
             elif diff <= -1.0: conf, rec = "LOW", f"TAKE_TM_{line}"
             else: conf, rec = "LOW", "SKIP"
             
-            verdicts.append({"market_type": "CORNERS", "recommendation": rec, "confidence": conf, "analysis_json": {"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg_corners": h2h.get("avg_corners", 0), "h2h_games": h2h.get("games", []), "referee_last_matches": ref_matches, "injuries": injuries, "glicko": glicko, "home_form_pct": home_form.get("form_pct"), "away_form_pct": away_form.get("form_pct")}})
+            analysis = base_analysis.copy()
+            analysis.update({"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg_corners": h2h.get("avg_corners", 0)})
+            verdicts.append({"market_type": "CORNERS", "recommendation": rec, "confidence": conf, "analysis_json": analysis})
     
     # ---- ВЕРДИКТ ПО ФОЛАМ ----
     if "fouls" in lines:
@@ -557,7 +646,9 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
             elif diff <= -2.0: conf, rec = "LOW", f"TAKE_TM_{line}"
             else: conf, rec = "LOW", "SKIP"
             
-            verdicts.append({"market_type": "FOULS", "recommendation": rec, "confidence": conf, "analysis_json": {"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg_fouls": h2h.get("avg_fouls", 0), "h2h_matches": h2h.get("matches_count", 0), "referee_avg_fouls": ref_fouls, "referee_name": referee_name, "h2h_games": h2h.get("games", []), "referee_last_matches": ref_matches, "injuries": injuries, "glicko": glicko, "home_form_pct": home_form.get("form_pct"), "away_form_pct": away_form.get("form_pct")}})
+            analysis = base_analysis.copy()
+            analysis.update({"model_prediction": round(pred, 1), "bookmaker_line": line, "difference": round(diff, 1), "h2h_avg_fouls": h2h.get("avg_fouls", 0), "h2h_matches": h2h.get("matches_count", 0), "referee_avg_fouls": ref_fouls, "referee_name": referee_name})
+            verdicts.append({"market_type": "FOULS", "recommendation": rec, "confidence": conf, "analysis_json": analysis})
     
     return verdicts
 
@@ -567,7 +658,7 @@ def generate_verdicts(game, statistics, odds_list, referee_name, home_id, away_i
 # ══════════════════════════════════════════════════════
 
 def main():
-    print("🚀 ЗАПУСК СБОРЩИКА (14 лиг, 3 сезона) + ТРАВМЫ, GLICKO, ФОРМА")
+    print("🚀 ЗАПУСК СБОРЩИКА (14 лиг, 3 сезона) + СОСТАВЫ, ТРАВМЫ, GLICKO, ФОРМА")
     print("=" * 55)
     
     total_matches = 0
@@ -587,7 +678,7 @@ def main():
                 collect_team_stats_directly(league_id, year)
                 update_referee_stats(league_id, year)
             
-            games = safe_get(f"{BASE}/games/list?leagueid={league_id}&year={year}&limit=200")
+            games = safe_get(f"{BASE}/games/list?leagueid={league_id}&year={year}&limit=50")
             
             if not games:
                 print(f"  ❌ Нет матчей для этого сезона")
@@ -643,7 +734,7 @@ def main():
                 except Exception as e:
                     print(f"    ❌ Ошибка: {e}")
                 
-                time.sleep(0.5)
+                time.sleep(1.0)
     
     print(f"\n{'='*55}")
     print(f"🎉 ГОТОВО!")
