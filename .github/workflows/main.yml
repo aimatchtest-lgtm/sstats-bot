@@ -1,18 +1,21 @@
 name: Run SStats Bot
-
 on:
   schedule:
-    - cron: '0 */12 * * *'  # Каждые 12 часов
+    - cron: '0 */12 * * *'
   workflow_dispatch:
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.9'
       - name: Install dependencies
