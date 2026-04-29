@@ -1,7 +1,7 @@
 name: Collect Odds
 on:
   schedule:
-    - cron: '0 * * * *'  # Каждый час
+    - cron: '0 */4 * * *'  # Каждые 4 часа
   workflow_dispatch:
 jobs:
   collect-odds:
